@@ -9,6 +9,43 @@ except ImportError:
 import zlib
 import datetime
 
+class ModelQuery(datastore.Query):
+  def __init__(self, model_cls, client,
+                                kind=None,
+                                dataset_id=None,
+                                namespace=None,
+                                ancestor=None,
+                                filters=(),
+                                projection=(),
+                                order=(),
+                                group_by=()):
+      super(ModelQuery, self).__init__(client, kind, dataset_id, namespace, ancestor, filters, projection,
+                                       order, group_by)
+      self._kind = model_cls.__name__
+      self.model_cls = model_cls
+      
+  def fetch(self, limit=None, offset=0, start_cursor=None, end_cursor=None,
+                          client=None):
+      iterator = super(ModelQuery, self).fetch(limit, offset, start_cursor, end_cursor, client)
+      return WrappedIterator(self.model_cls, iterator)
+
+  def __iter__(self):
+      for item in self.fetch():
+          yield item
+
+
+class WrappedIterator(object):
+    def __init__(self, model_cls, iterator):
+        self.iterator = iterator
+        self.model_cls = model_cls
+
+    def next_page(self):
+        return self.iterator.next_page()
+
+    def __iter__(self):
+        for item in self.iterator:
+            yield self.model_cls.from_entity(item)
+
 class Property(object):
     def __init__(self, name=None, indexed=True, repeated=False, required=False, default=None, choices=None, validator=None):
         self._name = name
@@ -251,12 +288,12 @@ class Model(entity.Entity):
     _properties = None
     _kind_map = {}
 
-    dataset = None
+    client = None
 
     _model_exclude_from_indexes = None
 
     def __init__(self, id=None, parent=None, **kwargs):
-        super(Model, self).__init__(self.dataset, exclude_from_indexes=self._model_exclude_from_indexes)
+        super(Model, self).__init__(exclude_from_indexes=self._model_exclude_from_indexes)
 
         if isinstance(parent, key.Key):
             flat = []
@@ -264,9 +301,10 @@ class Model(entity.Entity):
                 flat.extend([k["kind"], k.get("id") or k.get("name")])
 
             flat.extend([self.__class__.__name__, id])
-            self._key = key.Key.from_path(*flat)
+            self._key = Model.client.key(*flat)
         else:
-            self._key = key.Key.from_path(self.__class__.__name__, id)
+            if (id):
+                self._key = Model.client.key(self.__class__.__name__, id)
 
         for attr in self._properties:
             setattr(self, attr, getattr(self, attr))
@@ -277,7 +315,7 @@ class Model(entity.Entity):
     @classmethod
     def _fix_up_properties(cls):
         cls._properties = {}
-        cls._model_exclude_from_indexes = set()
+        cls._model_exclude_from_indexes = []
 
         for name in cls.__dict__:
             attr = cls.__dict__[name]
@@ -285,7 +323,7 @@ class Model(entity.Entity):
                 attr._fix_up(cls, name)
                 cls._properties[attr._name] = attr
                 if attr._indexed == False:
-                    cls._model_exclude_from_indexes.add(attr._name)
+                    cls._model_exclude_from_indexes.append(attr._name)
 
         cls._kind_map[cls.__name__] = cls
 
@@ -297,7 +335,7 @@ class Model(entity.Entity):
         if self._key:
             return "<%s%s %s>" % (
                 self.__class__.__name__,
-                self._key.path(),
+                self._key.path,
                 super(Model, self).__repr__()
             )
         else:
@@ -309,7 +347,8 @@ class Model(entity.Entity):
     @classmethod
     def from_entity(cls, entity):
         obj = cls()
-        obj._key = entity.key()
+        obj._key = entity.key
+        obj.key = entity.key
 
         for name in cls._properties:
             value = entity.get(name)
@@ -320,13 +359,13 @@ class Model(entity.Entity):
 
     @classmethod
     def get_by_id(cls, id):
-        entity = cls.dataset.get_entity(key.Key.from_path(cls.__name__, id))
+        entity = cls.client.get(cls.client.key(cls.__name__, id))
         if entity:
             return cls.from_entity(entity)
 
     @classmethod
     def get_multi(cls, ids):
-        entities = cls.dataset.get_entities([key.Key.from_path(cls.__name__, id) for id in ids])
+        entities = cls.client.get_multi([cls.client.key(cls.__name__, id) for id in ids])
         results = []
 
         for entity in entities:
@@ -337,15 +376,18 @@ class Model(entity.Entity):
 
         return results
 
+    @classmethod
+    def query(cls, **kwargs):
+      return ModelQuery(cls, cls.client, **kwargs)
+
     def put(self):
         for name, prop in self._properties.items():
             prop._prepare_for_put(self)
 
-        return self.save()
-
+        return self.__class__.client.put(self)
 
 def get_multi(keys):
-    entities = Model.dataset.get_entities(keys)
+    entities = Model.client.get_multi(keys)
 
     results = []
     for entity in entities:
